@@ -6,7 +6,7 @@ We provide unofficial implementations for decoding strategies that are recently 
 * TODO
 
 ## Examples
-```
+```python
 from cad import CAD
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
