@@ -5,7 +5,8 @@ import torch
 
 torch.manual_seed(42)
 
-class CAD:
+# Correction with Backtracking (CoBa)
+class CoBa:
     def __init__(self,
                  model: AutoModelForCausalLM,
                  tokenizer: AutoTokenizer,):
@@ -49,9 +50,9 @@ class CAD:
         return logits
     
     def generate(self,
-                 texts: Union[List[str], str], # shape: (batch_size, ...)
-                 texts_with_context: Union[List[str], str] = None,
-                 alpha: float = 0.5, # cad weight
+                 text: Union[List[str], str], # shape: (batch_size, ...)
+                 delta: float = 0.3, # probability threshold
+                 phi: float = 0.9, # max cosine similarity threshold
                  max_length: int = 8096,
                  max_new_tokens: int = 4096,
                  top_k: int = 50,
@@ -62,21 +63,19 @@ class CAD:
                  pad_token_id: int = None,
                  eos_token_id: int = None,
                  ):
-        inputs = self.tokenizer(texts, return_tensors='pt', padding=True,
+        inputs = self.tokenizer(text, return_tensors='pt', padding=True,
                                 truncation=True, max_length=max_length,
                                 add_special_tokens=False)
+        # sanity check
+        assert delta < 1.0, "probability threshold must be less than 1.0"
+        assert 0 <= phi <= 1.0, "cosine similarity threshold must be between 0 and 1.0"
+        assert max_new_tokens > 0, "max_new_tokens must be greater than 0"
+
         input_ids = inputs['input_ids'].to(self.model.device) # shape: (batch_size, seq_len)
+        assert input_ids.shape[0] == 1, "batch_size must be 1 for CoBa, since we need to backtrack"
         attention_mask = inputs['attention_mask'].to(self.model.device)
-        # context aware decoding
-        use_cad = texts_with_context is not None
-        if use_cad:
-            inputs_with_context = self.tokenizer(texts_with_context, return_tensors='pt', 
-                                                 padding=True, truncation=True,
-                                                 max_length=max_length, add_special_tokens=False)
-            input_ids_with_context = inputs_with_context['input_ids'].to(self.model.device)
-            attention_mask_with_context = inputs_with_context['attention_mask'].to(self.model.device)
-        input_token_len = input_ids_with_context.shape[1] if use_cad else \
-                            input_ids.shape[1]
+
+        input_token_len = input_ids.shape[1]
         if pad_token_id is None:
             pad_token_id = self.tokenizer.pad_token_id
         if eos_token_id is None:
@@ -90,25 +89,19 @@ class CAD:
                                           device=self.model.device) # shape: (batch_size, )
         this_peer_finished = False
         new_token_count = 0
+        total_searched_tokens = 0
+        last_token = None
         with torch.no_grad():
             while not this_peer_finished:
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                 )
-                next_token_logits = outputs.logits[:, -1, :] # shape: (batch_size, vocab_size)
-                if use_cad:
-                    outputs_with_context = self.model(
-                        input_ids=input_ids_with_context,
-                        attention_mask=attention_mask_with_context,
-                    )
-                    next_token_logits_with_context = outputs_with_context.logits[:, -1, :]
-                    next_token_logits = (1 + alpha) * next_token_logits_with_context - alpha * next_token_logits
+                next_token_logits = outputs.logits[:, -1, :] # shape: (1, vocab_size)
 
                 # repetition penalty
                 if repetition_penalty != 1.0:
-                    generated_ids = input_ids_with_context[:, input_token_len:] if use_cad else \
-                                        input_ids[:, input_token_len:]
+                    generated_ids = input_ids[:, input_token_len:]
                     next_token_logits = self._repetition_penalty_warp(
                         input_ids=generated_ids,
                         logits=next_token_logits,
@@ -136,41 +129,64 @@ class CAD:
                         temperature=temperature,
                     )
                 
-                # sample
-                if do_sample:
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                # get the most probable next token
+                probs = F.softmax(next_token_logits, dim=-1) # shape: (1, vocab_size)
+                if last_token is not None and total_searched_tokens <= 10 * max_new_tokens:
+                    # print(f"Last token: {self.tokenizer.decode(last_token)}")
+                    # print(f"Probability of last token: {probs[:, last_token].item()} set to 0.0")
+                    probs[:, last_token] = 0.0 # set the probability of last hallucinated token to 0
+                try:
+                    if do_sample:
+                        next_token = torch.multinomial(probs, num_samples=1).squeeze(1) # shape: (1, )
+                    else:
+                        next_token = torch.argmax(probs, dim=-1)
+                    next_token_prob = probs.gather(1, next_token.unsqueeze(-1)).squeeze(-1) # shape: (1, )
+
+                    # check hallucination
+                    # 1. probability threshold
+                    is_hallucination = next_token_prob.item() < delta
+                    # 2. cosine similarity threshold
+                    # TODO: implement cosine similarity threshold
+
+                except: # if all remaining tokens have probability 0
+                    if new_token_count > 0 and total_searched_tokens <= 10 * max_new_tokens:
+                        is_hallucination = True
+                    else:
+                        is_hallucination = False
+                        probs = F.softmax(next_token_logits, dim=-1) # shape: (1, vocab_size)
+                        if do_sample:
+                            next_token = torch.multinomial(probs, num_samples=1).squeeze(1) # shape: (1, )
+                        else:
+                            next_token = torch.argmax(probs, dim=-1)
+
+                total_searched_tokens += 1
+                if is_hallucination and new_token_count > 0 and total_searched_tokens <= 10 * max_new_tokens:
+                    # print("Hallucination detected! Backtracking...")
+                    # print(f"Remove the {new_token_count}-th token: {self.tokenizer.decode(next_token.item())}")
+                    # remove the last token
+                    last_token = input_ids[:, -1].item()
+                    input_ids = input_ids[:, :-1]
+                    attention_mask = attention_mask[:, :-1]
+                    new_token_count -= 1
+                    continue
                 else:
-                    next_tokens = torch.argmax(next_token_logits, dim=-1)
+                    last_token = None # reset last_token_idx
                 
                 # update input_ids, attention_mask
-                input_ids = torch.cat([input_ids, next_tokens.unsqueeze(-1)], dim=-1)
+                input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=-1)
                 attention_mask = torch.cat([attention_mask, unfinished_sequences.unsqueeze(-1)], dim=-1)
-                if use_cad:
-                    input_ids_with_context = torch.cat([input_ids_with_context, next_tokens.unsqueeze(-1)], dim=-1)
-                    attention_mask_with_context = torch.cat([attention_mask_with_context, unfinished_sequences.unsqueeze(-1)], dim=-1)
 
-                # finished sentences should have their next token be a padding token
+                # check if the next token is eos_token_id
                 if eos_token_id is not None:
-                    if pad_token_id is None:
-                        raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
-                    next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
-
-                # if eos_token was found in one sentence, set sentence to finished
-                if eos_token_id_tensor is not None:
-                    unfinished_sequences = unfinished_sequences.mul(
-                        next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
-                    )
-
-                    # stop when each sentence is finished
-                    if unfinished_sequences.max() == 0:
-                        this_peer_finished = True
+                    for eos_token in eos_token_id_tensor:
+                        if next_token.item() == eos_token.item():
+                            unfinished_sequences.fill_(0)
+                            this_peer_finished = True
 
                 # check max length
                 new_token_count += 1
                 if new_token_count >= max_new_tokens:
                     this_peer_finished = True
 
-        generated_ids = input_ids_with_context[:, input_token_len:] if use_cad else \
-                            input_ids[:, input_token_len:]
+        generated_ids = input_ids[:, input_token_len:]
         return self.tokenizer.batch_decode(generated_ids.tolist(), skip_special_tokens=True)
