@@ -101,7 +101,7 @@ class CAD:
                         attention_mask=attention_mask_with_context,
                     )
                     next_token_logits_with_context = outputs_with_context.logits[:, -1, :]
-                    next_token_logits = (1 + alpha) * next_token_logits - alpha * next_token_logits_with_context
+                    next_token_logits = (1 + alpha) * next_token_logits_with_context - alpha * next_token_logits
 
                 # repetition penalty
                 if repetition_penalty != 1.0:
